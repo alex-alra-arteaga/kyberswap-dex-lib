@@ -49,12 +49,26 @@ func NewPoolSimulator(entityPool entity.Pool, chainID valueobject.ChainID) (*Poo
 
 	allowEmptyTicks := hook.AllowEmptyTicks()
 
+	// V3Pool's tick/liquidity math -- and the reserve-based insufficient-balance check inside
+	// it -- always operates in each currency's real on-chain decimals. entityPool.Reserves
+	// stores a native-flagged index at the wrapped-native address's decimals instead (only
+	// differs from native's own decimals on Arc); convert it back before building the v3
+	// simulator, matching the Unwrap/WrapNativeAmount pair CalcAmountOut applies below.
+	entityPool.Reserves = slices.Clone(entityPool.Reserves)
+	for i, isNative := range staticExtra.IsNative {
+		if isNative && i < len(entityPool.Reserves) {
+			if amount, ok := new(big.Int).SetString(entityPool.Reserves[i], 10); ok {
+				entityPool.Reserves[i] = valueobject.UnwrapNativeAmount(chainID, amount).String()
+			}
+		}
+	}
+
 	v3PoolSimulator, err := uniswapv3.NewPoolSimulatorWithExtra(entityPool, extra.ExtraTickU256,
 		uniswapv3.SimulatorConfig{AllowEmptyTicks: allowEmptyTicks})
 	if err != nil {
 		return nil, err
 	}
-	v3PoolSimulator.Gas = defaultGas
+	v3PoolSimulator.Gas = DefaultGas
 
 	return &PoolSimulator{
 		PoolSimulator: v3PoolSimulator,
@@ -169,11 +183,12 @@ func (p *PoolSimulator) CalcAmountOut(param pool.CalcAmountOutParams) (swapResul
 		if !shared.IsDynamicFee(p.staticExtra.Fee) { // ignore if not dynamic fee
 		} else if beforeSwapResult.SwapFee >= FeeMax {
 			return nil, ErrInvalidFee
-		} else if beforeSwapResult.SwapFee > 0 && beforeSwapResult.SwapFee != p.V3Pool.Fee {
+		} else if beforeSwapResult.SwapFee > 0 && (beforeSwapResult.SwapFee != p.V3Pool.Fee || useExactTickTraversal(p.hook)) {
 			cloned := *poolSim
 			clonedV3Pool := *poolSim.V3Pool
 			cloned.V3Pool = &clonedV3Pool
 			cloned.V3Pool.Fee = beforeSwapResult.SwapFee
+			cloned.V3Pool.ExactTickTraversal = useExactTickTraversal(p.hook)
 			poolSim = &cloned
 		}
 	}
@@ -310,11 +325,12 @@ func (p *PoolSimulator) CalcAmountIn(param pool.CalcAmountInParams) (swapResult 
 		if !shared.IsDynamicFee(p.staticExtra.Fee) { // ignore if not dynamic fee
 		} else if beforeSwapResult.SwapFee >= FeeMax {
 			return nil, ErrInvalidFee
-		} else if beforeSwapResult.SwapFee > 0 && beforeSwapResult.SwapFee != p.V3Pool.Fee {
+		} else if beforeSwapResult.SwapFee > 0 && (beforeSwapResult.SwapFee != p.V3Pool.Fee || useExactTickTraversal(p.hook)) {
 			cloned := *poolSim
 			clonedV3Pool := *poolSim.V3Pool
 			cloned.V3Pool = &clonedV3Pool
 			cloned.V3Pool.Fee = beforeSwapResult.SwapFee
+			cloned.V3Pool.ExactTickTraversal = useExactTickTraversal(p.hook)
 			poolSim = &cloned
 		}
 	}
@@ -445,7 +461,26 @@ func (p *PoolSimulator) UpdateBalance(params pool.UpdateBalanceParams) {
 		p.hook.UpdateBalance(v4SwapInfo.HookSwapInfo)
 	}
 	params.SwapInfo = v4SwapInfo.PoolSwapInfo
+
+	// p.PoolSimulator tracks reserves at each currency's real on-chain decimals (see
+	// NewPoolSimulator); TokenAmountIn/Out here are in the wrapped-native address's decimals
+	// for a native-flagged leg, so rescale before applying, mirroring the Unwrap/WrapNativeAmount
+	// pair CalcAmountOut/CalcAmountIn apply around the same v3 math.
+	if idx := p.GetTokenIndex(params.TokenAmountIn.Token); idx >= 0 && p.staticExtra.IsNative[idx] {
+		params.TokenAmountIn.Amount = valueobject.UnwrapNativeAmount(p.chainID, params.TokenAmountIn.Amount)
+	}
+	if idx := p.GetTokenIndex(params.TokenAmountOut.Token); idx >= 0 && p.staticExtra.IsNative[idx] {
+		params.TokenAmountOut.Amount = valueobject.UnwrapNativeAmount(p.chainID, params.TokenAmountOut.Amount)
+	}
+
 	p.PoolSimulator.UpdateBalance(params)
+	if provider, ok := p.hook.(HookPoolStateProvider); ok {
+		state := provider.PoolState()
+		p.Info.Reserves = []*big.Int{new(big.Int).Set(state.Reserves[0]), new(big.Int).Set(state.Reserves[1])}
+		p.V3Pool.SqrtRatioX96.Set(&state.SqrtPriceX96)
+		p.V3Pool.Liquidity.Set(&state.Liquidity)
+		p.V3Pool.TickCurrent = state.Tick
+	}
 }
 
 // GetMetaInfo
@@ -531,4 +566,11 @@ func (s *PoolSimulator) SwapReceiveNativeIn(tokenIn, tokenOut string, _ valueobj
 func (s *PoolSimulator) SwapReturnNativeOut(tokenIn, tokenOut string, _ valueobject.ChainID) bool {
 	meta := s.GetMetaInfo(tokenIn, tokenOut).(PoolMetaInfo)
 	return meta.TokenOut == NativeTokenAddress
+}
+
+// Hook-specific exact traversal is set on the quote-local core copy, so it need
+// not alter the persisted core simulator format or other integrations.
+func useExactTickTraversal(hook Hook) bool {
+	exact, ok := hook.(interface{ UseExactTickTraversal() bool })
+	return ok && exact.UseExactTickTraversal()
 }
